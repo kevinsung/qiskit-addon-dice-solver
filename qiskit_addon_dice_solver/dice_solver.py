@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import struct
@@ -55,6 +56,8 @@ def solve_dice(
     working_dir: str | Path,
     spin_sq: float = 0.0,
     *,
+    select_cutoff: float = 5e-4,
+    energy_tol: float = 1e-10,
     max_iter: int = 10,
     clean_working_dir: bool = True,
     mpirun_options: Sequence[str] | str | None = None,
@@ -96,6 +99,8 @@ def solve_dice(
             `Knowles and Handy 1989 <https://www.sciencedirect.com/science/article/abs/pii/0010465589900337?via%3Dihub>`_.
         working_dir: An absolute path to a directory in which intermediate files can be written to and read from.
         spin_sq: Target value for the total spin squared for the ground state. If ``None``, no spin will be imposed.
+        select_cutoff: Cutoff threshold for retaining state vector coefficients.
+        energy_tol: Energy floating point tolerance.
         max_iter: The maximum number of HCI iterations to perform.
         clean_working_dir: A flag indicating whether to remove the intermediate files used by the ``Dice``
             command line application. If ``False``, the intermediate files will be left in a temporary directory in the
@@ -111,8 +116,10 @@ def solve_dice(
     Returns:
         Minimum energy from SCI calculation, SCI coefficients, and average orbital occupancy for spin-up and spin-down orbitals
     """
+    mf_as = tools.fcidump.to_scf(active_space_path)
+    num_orbitals = mf_as.get_hcore().shape[0]
+
     # Write Dice inputs to working dir
-    num_configurations = len(addresses[0])
     num_up = bin(addresses[0][0])[2:].count("1")
     num_dn = bin(addresses[1][0])[2:].count("1")
 
@@ -121,21 +128,21 @@ def solve_dice(
     _write_input_files(
         addresses,
         active_space_path,
+        num_orbitals,
         num_up,
         num_dn,
-        num_configurations,
         intermediate_dir,
         spin_sq,
-        max_iter,
+        select_cutoff=select_cutoff,
+        energy_tol=energy_tol,
+        max_iter=max_iter,
     )
 
     # Navigate to working dir and call Dice
     _call_dice(intermediate_dir, mpirun_options)
 
     # Read outputs and convert outputs
-    mf_as = tools.fcidump.to_scf(active_space_path)
-    num_orbitals = mf_as.get_hcore().shape[0]
-    e_dice, sci_coefficients, avg_occupancies = _read_dice_outputs(
+    e_dice, sci_coefficients, addresses, avg_occupancies = _read_dice_outputs(
         intermediate_dir, num_orbitals
     )
     e_dice -= mf_as.mol.energy_nuc()
@@ -147,6 +154,7 @@ def solve_dice(
     return (
         e_dice,
         sci_coefficients,
+        addresses,
         (avg_occupancies[:num_orbitals], avg_occupancies[num_orbitals:]),
     )
 
@@ -176,9 +184,11 @@ def _read_dice_outputs(
     # Construct the SCI wavefunction coefficients from Dice output dets.bin
     occs, amps = _read_wave_function_magnitudes(os.path.join(working_dir, "dets.bin"))
     addresses = _addresses_from_occupancies(occs)
-    sci_coefficients = _construct_ci_vec_from_addresses_amplitudes(amps, addresses)
+    sci_coefficients, addresses_a, addresses_b = (
+        _construct_ci_vec_from_addresses_amplitudes(amps, addresses)
+    )
 
-    return energy_dice, sci_coefficients, avg_occupancies
+    return energy_dice, sci_coefficients, (addresses_a, addresses_b), avg_occupancies
 
 
 def _call_dice(working_dir: Path, mpirun_options: Sequence[str] | str | None) -> None:
@@ -209,11 +219,13 @@ def _call_dice(working_dir: Path, mpirun_options: Sequence[str] | str | None) ->
 def _write_input_files(
     addresses: tuple[Sequence[int], Sequence[int]],
     active_space_path: str | Path,
+    num_orbitals: int,
     num_up: int,
     num_dn: int,
-    num_configurations: int,
     working_dir: str | Path,
     spin_sq: float,
+    select_cutoff: float,
+    energy_tol: float,
     max_iter: int,
 ) -> None:
     """Prepare the Dice inputs in the working directory."""
@@ -231,17 +243,18 @@ def _write_input_files(
     # The Dice/Riken branch this package is built on modifies the normal behavior
     # of the SHCI application, so we hard-code this value to prevent unintended
     # behavior due to these modifications.
-    schedule = "schedule\n0 1.e+12\nend\n"
+    schedule = f"schedule\n0 {select_cutoff}\nend\n"
     # Floating point tolerance for Davidson solver
     davidson_tol = "davidsonTol 1e-5\n"
     # Energy floating point tolerance
-    de = "dE 1e-10\n"
+    de = f"dE {energy_tol}\n"
     # The maximum number of HCI iterations to perform
     maxiter = f"maxiter {max_iter}\n"
     # We don't want Dice to be noisyu for now so we hard code noio
     noio = "noio\n"
     # The number of determinants to write as output. We always want all of them.
-    write_best_determinants = f"writeBestDeterminants {num_configurations}\n"
+    dim = math.comb(num_orbitals, num_up) * math.comb(num_orbitals, num_dn)
+    write_best_determinants = f"writeBestDeterminants {dim}\n"
     # Number of perturbation theory parameters. Must be 0.
     n_pt_iter = "nPTiter 0\n"
     # Requested reduced density matrices
@@ -369,6 +382,8 @@ def _construct_ci_vec_from_addresses_amplitudes(
     uniques = np.unique(np.array(addresses))
     num_dets = len(uniques)
     ci_vec = np.zeros((num_dets, num_dets))
+    addresses_a = np.zeros(num_dets, dtype=np.int64)
+    addresses_b = np.zeros(num_dets, dtype=np.int64)
 
     for idx, address in enumerate(addresses):
         address_a = address[0]
@@ -377,5 +392,11 @@ def _construct_ci_vec_from_addresses_amplitudes(
         i = np.where(uniques == address_a)[0][0]
         j = np.where(uniques == address_b)[0][0]
         ci_vec[i, j] = amps[idx]
+        if addresses_a[i]:
+            assert addresses_a[i] == uniques[i]
+        if addresses_b[j]:
+            assert addresses_b[j] == uniques[j]
+        addresses_a[i] = uniques[i]
+        addresses_b[j] = uniques[j]
 
-    return ci_vec
+    return ci_vec, addresses_a, addresses_b
