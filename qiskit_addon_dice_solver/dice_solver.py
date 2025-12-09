@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import shutil
@@ -25,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 from pyscf import tools
-
 from qiskit_addon_sqd.fermion import SCIResult, SCIState, bitstring_matrix_to_ci_strs
 
 # Ensure the runtime linker can find the local boost binaries at runtime
@@ -47,6 +47,61 @@ class DiceExecutionError(Exception):
             f"See the log file at {log_path} for more details."
         )
         super().__init__(message)
+
+
+@dataclasses.dataclass(frozen=True)
+class SCIStateSparse:
+    """The amplitudes and determinants describing a quantum state."""
+
+    amplitudes: np.ndarray
+    """
+    An array of length :math:`M` where :math:`M =` len(``ci_strs_a``) = len(``ci_strs_a``).
+    ``amplitudes[i]`` is the amplitude of the determinant pair (``ci_strs_a[i]``, ``ci_strs_b[i]``).
+    """
+
+    ci_strs_a: np.ndarray
+    """The alpha determinants."""
+
+    ci_strs_b: np.ndarray
+    """The beta determinants."""
+
+    norb: int
+    """The number of spatial orbitals."""
+
+    nelec: tuple[int, int]
+    """The numbers of alpha and beta electrons."""
+
+    def __post_init__(self):
+        """Validate dimensions of inputs."""
+        if not self.amplitudes.ndim == 1:
+            raise ValueError("amplitudes should be a one-dimensional array.")
+        if not self.amplitudes.shape == self.ci_strs_a.shape == self.ci_strs_b.shape:
+            raise ValueError(
+                "amplitudes, ci_strs_a, and ci_strs_b must all be the same length."
+            )
+
+    def save(self, filename):
+        """Save the SCIState object to an .npz file."""
+        np.savez(
+            filename,
+            amplitudes=self.amplitudes,
+            ci_strs_a=self.ci_strs_a,
+            ci_strs_b=self.ci_strs_b,
+            norb=self.norb,
+            nelec=self.nelec,
+        )
+
+    @classmethod
+    def load(cls, filename):
+        """Load an SCIState object from an .npz file."""
+        with np.load(filename) as data:
+            return cls(
+                data["amplitudes"],
+                data["ci_strs_a"],
+                data["ci_strs_b"],
+                norb=data["norb"],
+                nelec=tuple(data["nelec"]),
+            )
 
 
 def solve_sci(
@@ -173,10 +228,11 @@ def solve_hci(
     select_cutoff: float = 5e-4,
     energy_tol: float = 1e-10,
     max_iter: int = 10,
+    return_sparse_state: bool = False,
     mpirun_options: Sequence[str] | str | None = None,
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
-) -> tuple[float, SCIState, tuple[np.ndarray, np.ndarray]]:
+) -> tuple[float, SCIState | SCIStateSparse, tuple[np.ndarray, np.ndarray]]:
     """
     Approximate the ground state of a molecular Hamiltonian using the heat bath configuration interaction method.
 
@@ -264,7 +320,9 @@ def solve_hci(
     _call_dice(dice_dir, mpirun_options)
 
     # Read and convert outputs
-    e_dice, sci_state, avg_occupancies = _read_dice_outputs(dice_dir, norb, nelec)
+    e_dice, sci_state, avg_occupancies = _read_dice_outputs(
+        dice_dir, norb, nelec, return_sparse_state=return_sparse_state
+    )
 
     # Clean up the temp directory of intermediate files, if desired
     if clean_temp_dir:
@@ -380,7 +438,7 @@ def solve_fermion(
 
 
 def _read_dice_outputs(
-    dice_dir: str | Path, norb: int, nelec: tuple[int, int]
+    dice_dir: str | Path, norb: int, nelec: tuple[int, int], return_sparse_state: bool
 ) -> tuple[float, SCIState, np.ndarray]:
     """Calculate the estimated ground state energy and average orbitals occupancies from Dice outputs."""
     # Read in the avg orbital occupancies
@@ -400,16 +458,29 @@ def _read_dice_outputs(
     # Construct the SCI wavefunction coefficients from Dice output dets.bin
     occs, amps = _read_wave_function_magnitudes(os.path.join(dice_dir, "dets.bin"))
     ci_strs = _ci_strs_from_occupancies(occs)
-    sci_coefficients, ci_strs_a, ci_strs_b = _construct_ci_vec_from_amplitudes(
-        amps, ci_strs
-    )
-    sci_state = SCIState(
-        amplitudes=sci_coefficients,
-        ci_strs_a=ci_strs_a,
-        ci_strs_b=ci_strs_b,
-        norb=norb,
-        nelec=nelec,
-    )
+    if return_sparse_state:
+        sci_coefficients = np.array(amps)
+        strs_a, strs_b = zip(*ci_strs)
+        ci_strs_a = np.array(strs_a)
+        ci_strs_b = np.array(strs_b)
+        sci_state = SCIStateSparse(
+            amplitudes=sci_coefficients,
+            ci_strs_a=ci_strs_a,
+            ci_strs_b=ci_strs_b,
+            norb=norb,
+            nelec=nelec,
+        )
+    else:
+        sci_coefficients, ci_strs_a, ci_strs_b = _construct_ci_vec_from_amplitudes(
+            amps, ci_strs
+        )
+        sci_state = SCIState(
+            amplitudes=sci_coefficients,
+            ci_strs_a=ci_strs_a,
+            ci_strs_b=ci_strs_b,
+            norb=norb,
+            nelec=nelec,
+        )
 
     return energy_dice, sci_state, avg_occupancies
 
