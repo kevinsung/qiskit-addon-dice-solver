@@ -113,6 +113,7 @@ def solve_sci(
     *,
     # TODO allow spin_sq to be None
     spin_sq: float | None = None,
+    return_sparse_state: bool = False,
     mpirun_options: Sequence[str] | str | None = None,
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
@@ -155,6 +156,7 @@ def solve_sci(
         select_cutoff=2147483647,
         energy_tol=1e-10,
         max_iter=1,
+        return_sparse_state=return_sparse_state,
         mpirun_options=mpirun_options,
         temp_dir=temp_dir,
         clean_temp_dir=clean_temp_dir,
