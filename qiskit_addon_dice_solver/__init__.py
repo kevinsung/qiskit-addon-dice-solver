@@ -35,7 +35,6 @@ from .dice_solver import (
 
 __all__ = [
     "SCIStateSparse",
-    "solve_dice",
     "solve_fermion",
     "solve_hci",
     "solve_sci",
