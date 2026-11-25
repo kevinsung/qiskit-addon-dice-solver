@@ -28,7 +28,10 @@ import numpy as np
 from pyscf import tools
 from qiskit_addon_sqd.fermion import SCIResult, SCIState, bitstring_matrix_to_ci_strs
 
-from qiskit_addon_dice_solver._accelerate import from_bin_file_to_sci
+from qiskit_addon_dice_solver._accelerate import (
+    from_bin_file_to_sci,
+    from_bin_file_to_sci_sparse,
+)
 
 # Ensure the runtime linker can find the local boost binaries at runtime
 DICE_BIN = os.path.join(os.path.abspath(os.path.dirname(__file__)), "bin")
@@ -58,7 +61,7 @@ class SCIStateSparse:
 
     amplitudes: np.ndarray
     """
-    An array of length :math:`M` where :math:`M =` len(``ci_strs_a``) = len(``ci_strs_a``).
+    An array of length :math:`M` where :math:`M =` len(``ci_strs_a``) = len(``ci_strs_b``).
     ``amplitudes[i]`` is the amplitude of the determinant pair (``ci_strs_a[i]``, ``ci_strs_b[i]``).
     """
 
@@ -82,7 +85,7 @@ class SCIStateSparse:
             raise ValueError("amplitudes, ci_strs_a, and ci_strs_b must all be the same length.")
 
     def save(self, filename):
-        """Save the SCIState object to an .npz file."""
+        """Save the SCIStateSparse object to an .npz file."""
         np.savez(
             filename,
             amplitudes=self.amplitudes,
@@ -94,14 +97,14 @@ class SCIStateSparse:
 
     @classmethod
     def load(cls, filename):
-        """Load an SCIState object from an .npz file."""
+        """Load an SCIStateSparse object from an .npz file."""
         with np.load(filename) as data:
             return cls(
                 data["amplitudes"],
                 data["ci_strs_a"],
                 data["ci_strs_b"],
-                norb=data["norb"],
-                nelec=tuple(data["nelec"]),
+                norb=int(data["norb"]),
+                nelec=(int(data["nelec"][0]), int(data["nelec"][1])),
             )
 
 
@@ -553,16 +556,17 @@ def _read_dice_outputs(
     # Now format for multiple or single roots
     energy_dice = calc_e[0] if n_roots == 1 else list(calc_e)
 
-    state_cls = SCIStateSparse if return_sparse_state else SCIState
+    if return_sparse_state:
+        state_cls, read_dets = SCIStateSparse, from_bin_file_to_sci_sparse
+    else:
+        state_cls, read_dets = SCIState, from_bin_file_to_sci
     sci_state: SCIState | SCIStateSparse | list | None = None
     if return_sci_state:
         # Construct the SCI wavefunction coefficients from Dice output dets.bin
         states = []
         for root in range(n_roots):
             dets_file = "dets.bin" if root == 0 else f"dets_{root}.bin"
-            sci_coefficients, ci_strs_a, ci_strs_b = from_bin_file_to_sci(
-                os.path.join(dice_dir, dets_file)
-            )
+            sci_coefficients, ci_strs_a, ci_strs_b = read_dets(os.path.join(dice_dir, dets_file))
             states.append(
                 state_cls(
                     amplitudes=sci_coefficients,

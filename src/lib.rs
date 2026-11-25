@@ -17,48 +17,7 @@ use std::fs::File;
 /// (3) unique and sorted beta CIs.
 #[pyfunction]
 fn from_bin_file_to_sci(py: Python, path: &str) -> PyResult<Py<PyAny>> {
-    let (amps, dets_a, dets_b) =
-        py.detach(|| -> PyResult<(Vec<f64>, Vec<u64>, Vec<u64>)> {
-            let file = File::open(path)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("File error: {}", e)))?;
-            let mmap = unsafe { Mmap::map(&file) }
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Mmap error: {}", e)))?;
-            let data = &mmap[..];
-
-            if data.len() < 8 {
-                return Err(pyo3::exceptions::PyIOError::new_err(
-                    "File too small for header",
-                ));
-            }
-
-            let num_records = LittleEndian::read_u32(&data[0..4]);
-            let string_length = LittleEndian::read_u32(&data[4..8]) as usize;
-
-            if string_length > 64 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "String length {} exceeds maximum of 64",
-                    string_length
-                )));
-            }
-
-            let data_section = &data[8..];
-            let record_size = 8 + string_length;
-            let total_records = data_section.len() / record_size;
-
-            if total_records != num_records as usize {
-                return Err(pyo3::exceptions::PyIOError::new_err(format!(
-                    "Header claims {} records but found {}",
-                    num_records, total_records
-                )));
-            }
-
-            Ok(process_data(
-                data_section,
-                record_size,
-                string_length,
-                num_records as usize,
-            ))
-        })?;
+    let (amps, dets_a, dets_b) = py.detach(|| read_records(path))?;
 
     let (ci_vec_flat, nrows, ncols, unique_a, unique_b) = construct_ci_vec(&amps, &dets_a, &dets_b);
 
@@ -66,17 +25,77 @@ fn from_bin_file_to_sci(py: Python, path: &str) -> PyResult<Py<PyAny>> {
         pyo3::exceptions::PyValueError::new_err(format!("Array shape error: {}", e))
     })?;
 
-    let ci_vec_array = PyArray::from_owned_array(py, array);
-    let unique_a_array = PyArray1::from_vec(py, unique_a);
-    let unique_b_array = PyArray1::from_vec(py, unique_b);
-
-    let ci_obj: Py<PyAny> = ci_vec_array.unbind().into();
-    let a_obj: Py<PyAny> = unique_a_array.unbind().into();
-    let b_obj: Py<PyAny> = unique_b_array.unbind().into();
+    let ci_obj: Py<PyAny> = PyArray::from_owned_array(py, array).unbind().into();
+    let a_obj: Py<PyAny> = PyArray1::from_vec(py, unique_a).unbind().into();
+    let b_obj: Py<PyAny> = PyArray1::from_vec(py, unique_b).unbind().into();
 
     let tup = PyTuple::new(py, &[ci_obj, a_obj, b_obj])?;
 
     Ok(tup.unbind().into())
+}
+
+/// Reads the Dice output binary file and returns the SCI wavefunction in
+/// sparse form, using memory-mapped I/O.
+/// The three returned 1D arrays have one entry per determinant, in the order
+/// the determinants appear in the file:
+/// (1) amplitudes,
+/// (2) alpha CIs, and
+/// (3) beta CIs.
+#[pyfunction]
+fn from_bin_file_to_sci_sparse(py: Python, path: &str) -> PyResult<Py<PyAny>> {
+    let (amps, dets_a, dets_b) = py.detach(|| read_records(path))?;
+
+    let amps_obj: Py<PyAny> = PyArray1::from_vec(py, amps).unbind().into();
+    let a_obj: Py<PyAny> = PyArray1::from_vec(py, dets_a).unbind().into();
+    let b_obj: Py<PyAny> = PyArray1::from_vec(py, dets_b).unbind().into();
+
+    let tup = PyTuple::new(py, &[amps_obj, a_obj, b_obj])?;
+
+    Ok(tup.unbind().into())
+}
+
+/// Memory-maps the Dice output binary file, validates its header, and returns
+/// the amplitude and the alpha and beta determinants of every record.
+fn read_records(path: &str) -> PyResult<(Vec<f64>, Vec<u64>, Vec<u64>)> {
+    let file = File::open(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("File error: {}", e)))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Mmap error: {}", e)))?;
+    let data = &mmap[..];
+
+    if data.len() < 8 {
+        return Err(pyo3::exceptions::PyIOError::new_err(
+            "File too small for header",
+        ));
+    }
+
+    let num_records = LittleEndian::read_u32(&data[0..4]);
+    let string_length = LittleEndian::read_u32(&data[4..8]) as usize;
+
+    if string_length > 64 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "String length {} exceeds maximum of 64",
+            string_length
+        )));
+    }
+
+    let data_section = &data[8..];
+    let record_size = 8 + string_length;
+    let total_records = data_section.len() / record_size;
+
+    if total_records != num_records as usize {
+        return Err(pyo3::exceptions::PyIOError::new_err(format!(
+            "Header claims {} records but found {}",
+            num_records, total_records
+        )));
+    }
+
+    Ok(process_data(
+        data_section,
+        record_size,
+        string_length,
+        num_records as usize,
+    ))
 }
 
 /// Process bytes to compute amplitudes and alpha and beta determinants.
@@ -233,5 +252,6 @@ fn get_unique_and_map(values: &[u64]) -> (Vec<u64>, HashMap<u64, usize>) {
 #[pymodule]
 fn _accelerate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_bin_file_to_sci, m)?)?;
+    m.add_function(wrap_pyfunction!(from_bin_file_to_sci_sparse, m)?)?;
     Ok(())
 }
