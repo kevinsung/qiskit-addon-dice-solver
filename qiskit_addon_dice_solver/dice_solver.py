@@ -49,6 +49,7 @@ class DiceExecutionError(Exception):
             f"See the log file at {log_path} for more details."
         )
         super().__init__(message)
+        return
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,9 +79,7 @@ class SCIStateSparse:
         if not self.amplitudes.ndim == 1:
             raise ValueError("amplitudes should be a one-dimensional array.")
         if not self.amplitudes.shape == self.ci_strs_a.shape == self.ci_strs_b.shape:
-            raise ValueError(
-                "amplitudes, ci_strs_a, and ci_strs_b must all be the same length."
-            )
+            raise ValueError("amplitudes, ci_strs_a, and ci_strs_b must all be the same length.")
 
     def save(self, filename):
         """Save the SCIState object to an .npz file."""
@@ -115,11 +114,12 @@ def solve_sci(
     *,
     # TODO allow spin_sq to be None
     spin_sq: float | None = None,
+    n_roots: int = 1,
     return_sparse_state: bool = False,
     mpirun_options: Sequence[str] | str | None = None,
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
-) -> SCIResult:
+) -> SCIResult | list[SCIResult]:
     """Diagonalize Hamiltonian in subspace defined by CI strings.
 
     Args:
@@ -131,6 +131,9 @@ def solve_sci(
         norb: The number of spatial orbitals.
         nelec: The numbers of alpha and beta electrons.
         spin_sq: Target value for the total spin squared for the ground state. If ``None``, no spin will be imposed.
+        n_roots: The number of eigenvalues to compute
+        return_sparse_state: If ``True``, return the state as an :class:`SCIStateSparse`, which stores
+            only the nonzero amplitudes and their determinants, rather than as an ``SCIState``.
         mpirun_options: Options controlling the CPU resource allocation for the ``Dice`` command line application.
             These command-line options will be passed directly to the ``mpirun`` command line application during
             invocation of ``Dice``. These may be formatted as a ``Sequence`` of strings or a single string. If a ``Sequence``,
@@ -146,6 +149,9 @@ def solve_sci(
 
     Returns:
         The diagonalization result.
+
+    Raises:
+        ValueError: ``n_roots`` must be a positive integer
     """
     energy, sci_state, occupancies = solve_hci(
         hcore=one_body_tensor,
@@ -154,6 +160,7 @@ def solve_sci(
         nelec=nelec,
         ci_strs=ci_strings,
         spin_sq=spin_sq,
+        n_roots=n_roots,
         # Large select cutoff to prevent the addition of additional configurations
         select_cutoff=2147483647,
         energy_tol=1e-10,
@@ -163,6 +170,23 @@ def solve_sci(
         temp_dir=temp_dir,
         clean_temp_dir=clean_temp_dir,
     )
+    if n_roots < 1:
+        raise ValueError("n_roots must be a positive integer")
+    if n_roots > 1:
+        if (
+            not isinstance(energy, list)
+            or not isinstance(sci_state, list)
+            or not isinstance(occupancies, list)
+        ):
+            raise TypeError(
+                "Multiple roots were requested, but multiple eigenpairs weren't calculated."
+            )
+        sci_res_list = []
+        for i in range(n_roots):
+            sci_res_list.append(
+                SCIResult(energy[i], sci_state[i], orbital_occupancies=occupancies[i])
+            )
+        return sci_res_list
     return SCIResult(energy, sci_state, orbital_occupancies=occupancies)
 
 
@@ -174,10 +198,11 @@ def solve_sci_batch(
     nelec: tuple[int, int],
     *,
     spin_sq: float | None = None,
+    n_roots: int = 1,
     mpirun_options: Sequence[str] | str | None = None,
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
-) -> list[SCIResult]:
+) -> list[SCIResult] | list[list[SCIResult]]:
     """Diagonalize Hamiltonian in subspaces.
 
     Args:
@@ -189,6 +214,7 @@ def solve_sci_batch(
         norb: The number of spatial orbitals.
         nelec: The numbers of alpha and beta electrons.
         spin_sq: Target value for the total spin squared for the ground state. If ``None``, no spin will be imposed.
+        n_roots: The number of eigenvalues to calculate
         mpirun_options: Options controlling the CPU resource allocation for the ``Dice`` command line application.
             These command-line options will be passed directly to the ``mpirun`` command line application during
             invocation of ``Dice``. These may be formatted as a ``Sequence`` of strings or a single string. If a ``Sequence``,
@@ -213,6 +239,7 @@ def solve_sci_batch(
             norb=norb,
             nelec=nelec,
             spin_sq=spin_sq,
+            n_roots=n_roots,
             mpirun_options=mpirun_options,
             temp_dir=temp_dir,
             clean_temp_dir=clean_temp_dir,
@@ -229,6 +256,7 @@ def solve_hci(
     nelec: tuple[int, int],
     ci_strs: tuple[np.ndarray, np.ndarray] | None = None,
     spin_sq: float | None = None,
+    n_roots: int = 1,
     select_cutoff: float = 5e-4,
     energy_tol: float = 1e-10,
     max_iter: int = 10,
@@ -237,9 +265,15 @@ def solve_hci(
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
     return_sci_state: bool = True,
-) -> tuple[float, SCIState | SCIStateSparse | None, tuple[np.ndarray, np.ndarray]]:
-    """
-    Approximate the ground state of a molecular Hamiltonian using the heat bath configuration interaction method.
+) -> (
+    tuple[float, SCIState | SCIStateSparse | None, tuple[np.ndarray, np.ndarray]]
+    | tuple[
+        list[float],
+        list[SCIState] | list[SCIStateSparse] | None,
+        list[tuple[np.ndarray, np.ndarray]],
+    ]
+):
+    """Approximate the ground state of a molecular Hamiltonian using the heat bath configuration interaction method.
 
     In order to leverage the multi-processing nature of this tool, the user must specify
     the CPU resources to use via the `mpirun_options` argument.
@@ -273,9 +307,12 @@ def solve_hci(
             A CI string is specified as an integer whose binary expansion encodes the string. For example,
             the Hartree-Fock string with 3 electrons in 5 orbitals is `0b00111`.
         spin_sq: Target value for the total spin squared for the ground state. If ``None``, no spin will be imposed.
+        n_roots: The number of eigenvalues to calculate
         select_cutoff: Cutoff threshold for retaining state vector coefficients.
         energy_tol: Energy floating point tolerance.
         max_iter: The maximum number of HCI iterations to perform.
+        return_sparse_state: If ``True``, return the state as an :class:`SCIStateSparse`, which stores
+            only the nonzero amplitudes and their determinants, rather than as an ``SCIState``.
         mpirun_options: Options controlling the CPU resource allocation for the ``Dice`` command line application.
             These command-line options will be passed directly to the ``mpirun`` command line application during
             invocation of ``Dice``. These may be formatted as a ``Sequence`` of strings or a single string. If a ``Sequence``,
@@ -292,10 +329,12 @@ def solve_hci(
 
     Returns:
         - Minimum energy from SCI calculation
-        - Approximate ground state from SCI, or None if `return_sci_state` is set to
-          False
+        - Approximate ground state from SCI, or None if `return_sci_state` is set to False
         - Average orbital occupancy
+        - ``n_roots`` must be a positive integer
     """
+    if n_roots < 1:
+        raise ValueError("n_roots must be a positive integer.")
     n_alpha, n_beta = nelec
 
     if ci_strs is None:
@@ -305,6 +344,9 @@ def solve_hci(
     # Set up the temp directory
     temp_dir = temp_dir or tempfile.gettempdir()
     dice_dir = Path(tempfile.mkdtemp(prefix="dice_cli_files_", dir=temp_dir))
+
+    # We want to see the temporary directory in order to look for it later
+    print("Dice temporary directory: ", dice_dir)
 
     # Write the integrals out as an FCI dump for Dice command line app
     active_space_path = dice_dir / "fcidump.txt"
@@ -318,6 +360,7 @@ def solve_hci(
         num_dn=n_beta,
         dice_dir=dice_dir,
         spin_sq=spin_sq,
+        n_roots=n_roots,
         select_cutoff=select_cutoff,
         energy_tol=energy_tol,
         max_iter=max_iter,
@@ -331,6 +374,7 @@ def solve_hci(
         dice_dir,
         norb,
         nelec,
+        n_roots=n_roots,
         return_sci_state=return_sci_state,
         return_sparse_state=return_sparse_state,
     )
@@ -339,11 +383,21 @@ def solve_hci(
     if clean_temp_dir:
         shutil.rmtree(dice_dir)
 
+    # Divide avg occumpancies in spin up and down orbitals and return
+    if n_roots > 1:
+        avg_occupancies_split = []
+        for avg_occ in avg_occupancies:
+            avg_occupancies_split.append((avg_occ[:norb], avg_occ[norb:]))
+        return (
+            e_dice,
+            sci_state,
+            avg_occupancies_split,
+        )  # type: ignore
     return (
         e_dice,
         sci_state,
         (avg_occupancies[:norb], avg_occupancies[norb:]),
-    )
+    )  # type: ignore
 
 
 def solve_fermion(
@@ -352,11 +406,15 @@ def solve_fermion(
     hcore: np.ndarray,
     eri: np.ndarray,
     *,
+    n_roots: int = 1,
     open_shell: bool = False,
     mpirun_options: Sequence[str] | str | None = None,
     temp_dir: str | Path | None = None,
     clean_temp_dir: bool = True,
-) -> tuple[float, SCIState, tuple[np.ndarray, np.ndarray]]:
+) -> (
+    tuple[float, SCIState, tuple[np.ndarray, np.ndarray]]
+    | tuple[list[float], list[SCIState], list[tuple[np.ndarray, np.ndarray]]]
+):
     """Approximate the ground state of a molecular Hamiltonian given a bitstring matrix defining the Hilbert subspace.
 
     This solver is designed for compatibility with `qiskit-addon-sqd <https://qiskit.github.io/qiskit-addon-sqd/>`_ workflows.
@@ -396,6 +454,7 @@ def solve_fermion(
                 The expected ordering is ``([a_str_0, ..., a_str_N], [b_str_0, ..., b_str_M])``.
         hcore: Core Hamiltonian matrix representing single-electron integrals
         eri: Electronic repulsion integrals representing two-electron integrals
+        n_roots: The number of eigenvalues to calculate
         open_shell: A flag specifying whether configurations from the left and right
             halves of the bitstrings should be kept separate. If ``False``, CI strings
             from the left and right halves of the bitstrings are combined into a single
@@ -436,6 +495,7 @@ def solve_fermion(
         ci_strs=ci_strs,
         # Hard-code S^2 = 0 until other values are supported
         spin_sq=0.0,
+        n_roots=n_roots,
         # Large select cutoff to prevent the addition of additional configurations
         select_cutoff=2147483647,
         energy_tol=1e-10,
@@ -444,53 +504,77 @@ def solve_fermion(
         temp_dir=temp_dir,
         clean_temp_dir=clean_temp_dir,
     )
-    return e_dice, sci_state, avg_occupancies
+    return e_dice, sci_state, avg_occupancies  # type: ignore
 
 
 def _read_dice_outputs(
     dice_dir: str | Path,
     norb: int,
     nelec: tuple[int, int],
+    n_roots: int = 1,
     return_sci_state: bool = True,
     return_sparse_state: bool = False,
-) -> tuple[float, SCIState | None, np.ndarray]:
+) -> (
+    tuple[float, SCIState | SCIStateSparse | None, np.ndarray]
+    | tuple[list[float], list[SCIState] | list[SCIStateSparse] | None, list[np.ndarray]]
+):
     """Calculate the estimated ground state energy and average orbitals occupancies from Dice outputs."""
-    # Read in the avg orbital occupancies
-    spin1_rdm_dice = np.loadtxt(os.path.join(dice_dir, "spin1RDM.0.0.txt"), skiprows=1)
-    avg_occupancies = np.zeros(2 * norb)
-    for i in range(spin1_rdm_dice.shape[0]):
-        if spin1_rdm_dice[i, 0] == spin1_rdm_dice[i, 1]:
-            orbital_id = spin1_rdm_dice[i, 0]
-            parity = orbital_id % 2
-            avg_occupancies[int(orbital_id // 2 + parity * norb)] = spin1_rdm_dice[i, 2]
+    ## Code for multiple roots
+    if n_roots > 1:
+        avg_occupancies_list = []
+        for root in range(n_roots):
+            spin1_rdm_dice = np.loadtxt(
+                os.path.join(dice_dir, f"spin1RDM.{root}.{root}.txt"), skiprows=1
+            )
+            avg_occupancy = np.zeros(2 * norb)
+            for i in range(spin1_rdm_dice.shape[0]):
+                if spin1_rdm_dice[i, 0] == spin1_rdm_dice[i, 1]:
+                    orbital_id = spin1_rdm_dice[i, 0]
+                    parity = orbital_id % 2
+                    avg_occupancy[int(orbital_id // 2 + parity * norb)] = spin1_rdm_dice[i, 2]
+            # Append the n-th root avg occupancies to the list
+            avg_occupancies_list.append(avg_occupancy)
+        avg_occupancies = np.array(avg_occupancies_list)
+    elif n_roots == 1:
+        # Read in the avg orbital occupancies
+        spin1_rdm_dice = np.loadtxt(os.path.join(dice_dir, "spin1RDM.0.0.txt"), skiprows=1)
+        avg_occupancies = np.zeros(2 * norb)
+        for i in range(spin1_rdm_dice.shape[0]):
+            if spin1_rdm_dice[i, 0] == spin1_rdm_dice[i, 1]:
+                orbital_id = spin1_rdm_dice[i, 0]
+                parity = orbital_id % 2
+                avg_occupancies[int(orbital_id // 2 + parity * norb)] = spin1_rdm_dice[i, 2]
 
     # Read in the estimated ground state energy
+    format_file = "d" * n_roots
     with open(os.path.join(dice_dir, "shci.e"), "rb") as file_energy:
-        bytestring_energy = file_energy.read(8)
-    energy_dice = struct.unpack("d", bytestring_energy)[0]
-    sci_state: SCIState | None = None
+        calc_e = struct.unpack(format_file, file_energy.read())
+
+    # Now format for multiple or single roots
+    energy_dice = calc_e[0] if n_roots == 1 else list(calc_e)
+
+    state_cls = SCIStateSparse if return_sparse_state else SCIState
+    sci_state: SCIState | SCIStateSparse | list | None = None
     if return_sci_state:
         # Construct the SCI wavefunction coefficients from Dice output dets.bin
-        sci_coefficients, ci_strs_a, ci_strs_b = from_bin_file_to_sci(
-            os.path.join(dice_dir, "dets.bin")
-        )
-        if return_sparse_state:
-            sci_state = SCIStateSparse(
-                amplitudes=sci_coefficients,
-                ci_strs_a=ci_strs_a,
-                ci_strs_b=ci_strs_b,
-                norb=norb,
-                nelec=nelec,
+        states = []
+        for root in range(n_roots):
+            dets_file = "dets.bin" if root == 0 else f"dets_{root}.bin"
+            sci_coefficients, ci_strs_a, ci_strs_b = from_bin_file_to_sci(
+                os.path.join(dice_dir, dets_file)
             )
-        else:
-            sci_state = SCIState(
-                amplitudes=sci_coefficients,
-                ci_strs_a=ci_strs_a,
-                ci_strs_b=ci_strs_b,
-                norb=norb,
-                nelec=nelec,
+            states.append(
+                state_cls(
+                    amplitudes=sci_coefficients,
+                    ci_strs_a=ci_strs_a,
+                    ci_strs_b=ci_strs_b,
+                    norb=norb,
+                    nelec=nelec,
+                )
             )
-    return energy_dice, sci_state, avg_occupancies
+        sci_state = states[0] if n_roots == 1 else states
+
+    return energy_dice, sci_state, avg_occupancies  # type: ignore
 
 
 def _call_dice(dice_dir: Path, mpirun_options: Sequence[str] | str | None) -> None:
@@ -527,6 +611,7 @@ def _write_input_files(
     num_dn: int,
     dice_dir: str | Path,
     spin_sq: float | None,
+    n_roots: int,
     select_cutoff: float,
     energy_tol: float,
     max_iter: int,
@@ -539,7 +624,7 @@ def _write_input_files(
     ### Write the input.dat ###
     num_elec = num_up + num_dn
     # Return only the lowest-energy state
-    nroots = "nroots 1\n"
+    nroots = f"nroots {int(n_roots)}\n"
     # Spin squared
     spin = f"spin {spin_sq}\n" if spin_sq is not None else ""
     # Path to active space dump
