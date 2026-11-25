@@ -1,0 +1,15 @@
+---
+features:
+  - |
+    Added :class:`qiskit_addon_dice_solver.SCIStateSparse`, which stores an SCI state as
+    one-dimensional arrays of amplitudes and alpha and beta strings, with one entry per
+    determinant. Unlike ``SCIState``, it does not store a dense matrix over every combination
+    of unique alpha and beta strings, so it can use much less memory for large calculations.
+    It can be saved to and loaded from an ``.npz`` file with
+    :meth:`~qiskit_addon_dice_solver.SCIStateSparse.save` and
+    :meth:`~qiskit_addon_dice_solver.SCIStateSparse.load`.
+  - |
+    :func:`qiskit_addon_dice_solver.solve_hci` and :func:`qiskit_addon_dice_solver.solve_sci`
+    now accept a ``return_sparse_state`` argument. If ``True``, the returned state is an
+    :class:`~qiskit_addon_dice_solver.SCIStateSparse` read directly from the determinants
+    output by Dice, instead of an ``SCIState``.

@@ -23,6 +23,15 @@ Functions
 
    solve_fermion
    solve_hci
+
+Classes
+=======
+
+.. autosummary::
+   :toctree: ../stubs/
+   :nosignatures:
+
+   SCIStateSparse
 """
 
 from .dice_solver import (
